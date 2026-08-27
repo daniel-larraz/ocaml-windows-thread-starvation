@@ -1,5 +1,7 @@
 # A busy thread starves its domain on Windows, from OCaml 5.5.0
 
+Reported upstream as [ocaml/ocaml#15028](https://github.com/ocaml/ocaml/issues/15028).
+
 On Windows, an OCaml thread that never yields voluntarily keeps the
 runtime lock and the other threads of its domain never run. Not slowly
 — at all, for as long as it goes on computing.
