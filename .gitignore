@@ -1,0 +1,5 @@
+starve
+starve.exe
+*.cm[iox]
+*.o
+*.obj
