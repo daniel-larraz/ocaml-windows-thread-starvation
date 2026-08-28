@@ -31,11 +31,19 @@ jobs:
       with:
         ocaml-compiler: 5.5.0
 
+    # `opam switch create <name> <git url>` is not a thing -- opam reads
+    # the argument as a package. The compiler package is pinned to the
+    # branch instead, then installed from it. Both branches say
+    # 5.5.1+dev0-2026-06-19, which is what ocaml-variants.5.5.1+trunk
+    # expects.
     - name: Build the compiler under test
       shell: bash
       run: |
         set -euo pipefail
-        opam switch create under-test "${{ matrix.url }}" --yes
+        opam switch create under-test --empty --yes
+        opam pin add --switch under-test --yes --no-action \
+          ocaml-variants.5.5.1+trunk "${{ matrix.url }}"
+        opam install --switch under-test --yes ocaml-variants.5.5.1+trunk
         opam exec --switch under-test -- ocamlopt -version
 
     - name: Build the reproducer
