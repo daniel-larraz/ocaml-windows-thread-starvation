@@ -1,6 +1,12 @@
 # A busy thread starves its domain on Windows, from OCaml 5.5.0
 
-Reported upstream as [ocaml/ocaml#15028](https://github.com/ocaml/ocaml/issues/15028).
+Reported upstream as [ocaml/ocaml#15028](https://github.com/ocaml/ocaml/issues/15028),
+fixed by [ocaml/ocaml#15029](https://github.com/ocaml/ocaml/pull/15029) — the backup
+thread's handle is closed after creation on Windows, so the invalid handle reaching
+`caml_plat_thread_equal` came back as `-1`, which read as true.
+
+Confirmed against that branch: with the fix, `busy` and `alloc` finish in 8.0s with a
+worst wait of 0.06s, while the 5.5 branch they are based on still hangs.
 
 On Windows, an OCaml thread that never yields voluntarily keeps the
 runtime lock and the other threads of its domain never run. Not slowly
