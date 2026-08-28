@@ -6,6 +6,7 @@ name: Does a busy thread starve its domain
 on:
   workflow_dispatch:
   push:
+    paths: [ 'starve.ml', '.github/workflows/starve.yml' ]
 
 jobs:
   starve:
