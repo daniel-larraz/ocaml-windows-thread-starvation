@@ -1,0 +1,52 @@
+# Is 5.5.1 enough for a program shaped like Kind 2 -- about ten domains
+# with threads of their own -- rather than the one domain and two
+# threads that starve.ml tests? 5.5.0 is there as the control.
+name: Kind 2 shaped, on 5.5.1 and 5.5.0
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shaped:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        ocaml: ["5.5.0", "5.5.1"]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: ${{ matrix.ocaml }}
+
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam exec -- ocamlopt -version
+        opam exec -- ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa \
+          many_domains.ml -o many_domains.exe
+
+    - name: Run
+      shell: bash
+      run: |
+        set -u
+        bounded() {
+          local secs=$1 ; shift
+          "$@" & local pid=$!
+          ( sleep "$secs" ; kill -9 "$pid" 2>/dev/null ) & local killer=$!
+          wait "$pid" ; local rc=$?
+          kill "$killer" 2>/dev/null ; wait "$killer" 2>/dev/null
+          return $rc
+        }
+
+        # others per beside -- the last is starve.ml's shape, and is the
+        # arm that must stay clean on 5.5.1.
+        for arm in "9 3 1" "9 3 0" "9 1 0" "3 3 0" "0 1 1" ; do
+          echo "== others/per/beside = $arm (expect ~8s) =="
+          bounded 25 ./many_domains.exe $arm 8 \
+            || echo "   NO RESULT: killed at 25s, or exit $?"
+        done
