@@ -55,6 +55,11 @@ jobs:
             ./barrier.exe "$1" 30 "$2" &
           target=$!
           sleep 1
-          ./pauses.exe "$EVDIR" "$target" 32 2>&1 | tail -12
+          # Zero, not "$target": under Cygwin's bash `$!` is a Cygwin
+          # pid while the ring buffer is named after the Windows one,
+          # so the consumer finds the ring in the directory instead of
+          # being told which process to watch. That mismatch is why the
+          # Windows job reported no phases at all last time.
+          ./pauses.exe "$EVDIR" 0 32 2>&1 | tail -14
           wait $target || true
         done

@@ -15,10 +15,33 @@ let () =
   let pid = int_of_string Sys.argv.(2) in
   let watch = float_of_string Sys.argv.(3) in
 
+  (* A pid of zero means "whatever ring is in that directory".
+
+     Under Cygwin's bash, `$!` is a Cygwin pid and the ring buffer is
+     named after the Windows one, so a caller there cannot always say
+     which process it started. The directory holds one ring per run, so
+     finding it is more reliable than being told. *)
+  let pid_in dir =
+    match
+      Sys.readdir dir |> Array.to_list
+      |> List.filter (fun f -> Filename.check_suffix f ".events")
+    with
+    | [] -> None
+    | f :: _ -> int_of_string_opt (Filename.remove_extension f)
+  in
+
   (* The target may not have created its ring yet. *)
   let rec cursor_of tries =
-    match Runtime_events.create_cursor (Some (dir, pid)) with
-    | c -> c
+    let target = if pid <> 0 then Some pid else pid_in dir in
+    match
+      match target with
+      | None -> failwith "no ring buffer in that directory yet"
+      | Some p -> Runtime_events.create_cursor (Some (dir, p))
+    with
+    | c ->
+      Printf.printf "watching pid %d in %s\n%!"
+        (match target with Some p -> p | None -> 0) dir ;
+      c
     | exception e ->
       if tries = 0 then raise e
       else ( Unix.sleepf 0.2 ; cursor_of (tries - 1) )
