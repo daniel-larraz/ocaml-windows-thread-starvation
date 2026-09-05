@@ -1,0 +1,51 @@
+# How long does a stop-the-world rendezvous take? Measured inside Kind 2
+# on Windows the barrier phases run six to fourteen seconds; on Linux,
+# with the same shape of load, the longest is a twentieth of a second.
+# Both are measured by the same external consumer, so the quantity is
+# the same quantity.
+name: How long is the barrier
+
+on:
+  workflow_dispatch:
+
+jobs:
+  barrier:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.5.1
+
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam exec -- ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa \
+          barrier.ml -o barrier.exe
+        opam exec -- ocamlopt -I +unix -I +runtime_events \
+          unix.cmxa runtime_events.cmxa probe_pauses.ml -o pauses.exe
+
+    - name: Run
+      shell: bash
+      run: |
+        set -u
+        # allocating / idle. The first is Kind 2's shape: about twelve
+        # domains, some of them waiting rather than working.
+        for arm in "11 3" "11 0" "6 2" "3 1" "1 0" ; do
+          set -- $arm
+          echo "== allocating=$1 idle=$2 =="
+          rm -rf ev ; mkdir -p ev
+          OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$PWD/ev" \
+            ./barrier.exe "$1" 30 "$2" &
+          target=$!
+          sleep 1
+          ./pauses.exe "$PWD/ev" "$target" 32 2>&1 | tail -12
+          wait $target || true
+        done
