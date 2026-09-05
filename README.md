@@ -1,115 +1,92 @@
-# A busy thread starves its domain on Windows, from OCaml 5.5.0
+# Stop-the-world barriers take seconds on Windows
 
-Reported upstream as [ocaml/ocaml#15028](https://github.com/ocaml/ocaml/issues/15028),
-fixed by [ocaml/ocaml#15029](https://github.com/ocaml/ocaml/pull/15029) — the backup
-thread's handle is closed after creation on Windows, so the invalid handle reaching
-`caml_plat_thread_equal` came back as `-1`, which read as true.
+On Windows, a stop-the-world rendezvous in OCaml 5 can take **five to
+ten seconds** when domains that allocate run alongside a domain that
+repeatedly enters and leaves a blocking section. Every domain stops for
+the duration. Linux and macOS do the same work with barriers of a few
+hundredths of a second.
 
-Confirmed against that branch: with the fix, `busy` and `alloc` finish in 8.0s with a
-worst wait of 0.06s, while the 5.5 branch they are based on still hangs.
-
-On Windows, an OCaml thread that never yields voluntarily keeps the
-runtime lock and the other threads of its domain never run. Not slowly
-— at all, for as long as it goes on computing.
-
-`Thread.yield` still hands the lock over correctly. What stops working
-is the handoff nobody asked for: the tick thread that requests one every
-50ms.
-
-Linux and macOS are unaffected. OCaml 5.4.0 and earlier are unaffected
-on Windows too, so this is a regression in 5.5.0.
-
-## The program
-
-One domain. Some threads that work, and one that means to wake every
-10ms and reports how late it was. No oversubscription, no second domain.
-The three arms differ only in how the workers behave:
-
-| arm | the workers | who can move the lock along |
-| --- | --- | --- |
-| `busy` | compute, allocate nothing | only the tick thread |
-| `alloc` | allocate hard | only the tick thread, but safe points are everywhere |
-| `yield` | compute, then `Thread.yield` | the worker itself |
-
-`workers=0` is the control: the measuring thread alone, nothing to
-contend with.
+Measured with `runtime_events`, read by a consumer **outside** the
+process — an observer inside it is stopped too.
 
 ## What happens
 
-Worst lateness of the measuring thread, `workers=1`, on GitHub-hosted
-runners:
+`barrier.ml`: N domains allocating steadily, M domains doing nothing
+but `Thread.delay 0.01` in a loop. Longest single `stw_handler` span,
+three rounds on each platform, 30s per run, four cores:
 
-| | 5.2.1 | 5.3.0 | 5.4.0 | 5.5.0 |
-| --- | --- | --- | --- | --- |
-| `windows-latest` | 0.05s | 0.05s | 0.06s | **never finishes** |
-| `ubuntu-latest` | 0.04s | 0.04s | 0.04s | 0.04s |
-| `macos-latest` | 0.28s | 0.21s | 0.25s | 0.12s |
+| allocating / idle | windows-latest | ubuntu-latest | macos-latest |
+| --- | --- | --- | --- |
+| 11 / 3 | **5.94s, 7.12s, 5.96s** | 0.03s | 0.14s |
+| 11 / 1 | **10.56s, 0.29s, 8.29s** | 0.03s | 0.13s |
+| **11 / 0** | **0.12s, 0.13s, 0.13s** | 0.03s | 0.13s |
+| 6 / 2 | 0.13s, **5.89s**, 0.18s | 0.01s | 0.18s |
 
-On Windows with 5.5.0, `busy` and `alloc` are killed at the 20s bound
-against an 8s expectation, while in the same job on the same binary:
+`interrupt_remote` and `minor_leave_barrier` run to the same lengths as
+`stw_handler` in the affected rounds.
 
-```
-== yield workers=1 (expect ~8s) ==
-yield  workers=1  in 1 domain  cores=4  wall= 8.0s  worst wait 0.02s
-== busy workers=1 (expect ~8s) ==
-   NO RESULT: killed at 20s
-```
+## The idle domain is necessary
 
-`workers=0` passes on 5.5.0, so `Thread.delay` is fine on its own and
-the hang needs a second thread.
+Eleven domains allocating flat out with **no** idle domain beside them
+never froze: 0.12s, 0.13s, 0.13s. Add **one** idle domain and the
+barrier runs to seconds in most rounds. Six of nine runs with an idle
+domain froze; none of three without.
 
-The `alloc` arm matters: allocating 100k times per iteration passes safe
-points constantly, so the running thread has every opportunity to notice
-a request to hand over, and still does not.
-
-An earlier run left it unbounded: it was killed after **5m43s** without
-printing its first result, so this is not slowness.
-
-## Not the environment
-
-`setup-ocaml` builds through Cygwin and the runs above go through
-`opam exec`. The workflow also launches the same `.exe` straight from
-PowerShell, with neither in the picture, and the result is the same —
-`busy` still running at 20s, `yield` exiting cleanly after 8.4s.
+It is not simply a blocked domain. An earlier version of this test
+parked domains in a single long `Unix.read` and found nothing. What
+provokes it is the churn — leaving and re-entering a blocking section
+every ten milliseconds — beside domains that keep forcing minor
+collections.
 
 ## Reproducing it
 
-No opam, no dune, no libraries beyond `threads` and `unix`:
-
 ```
-ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa starve.ml -o starve
-./starve busy 1 8      # Windows 5.5.0: does not finish
-./starve yield 1 8     # finishes, worst wait ~0.02s
+ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa barrier.ml -o barrier
+ocamlopt -I +unix -I +runtime_events unix.cmxa runtime_events.cmxa \
+  probe_pauses.ml -o pauses
+
+mkdir ev
+OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$PWD/ev" \
+  ./barrier 11 30 3 &
+./pauses "$PWD/ev" 0 32
 ```
 
-Or push to a fork and read `.github/workflows/starve.yml`, which is the
-table above.
+`probe_pauses.ml` prints every runtime phase span over a second, with
+the domain it happened in, and totals at the end. A pid of `0` means
+"whatever ring is in that directory" — under Cygwin's bash, `$!` is a
+Cygwin pid while the ring is named after the Windows one.
 
-## What this does not say
-
-Why. The tick thread's sleep and the runtime lock's wait and wake are
-platform code, and [ocaml/ocaml#13416][pr] rewrote them for Windows —
-replacing winpthreads with SRW locks and condition variables — merged
-2025-12-18, after 5.4.0 branched (2025-10-09) and before 5.5.0
-(2026-06-19). That makes it a **suspect**, not a conclusion: 5.5.0
-carries plenty besides it, and no commit-level bisect has been done.
-
-An earlier guess of ours — that the wake in `st_thread_yield` pairs with
-the yielding thread's own wait — is refuted by this program: that would
-break `Thread.yield`, and `Thread.yield` is the arm that works.
-
-[pr]: https://github.com/ocaml/ocaml/pull/13416
+On Windows the events directory must be a native path (`cygpath -w`),
+or the target cannot create its ring at all.
 
 ## Where it was found
 
-Kind 2, a model checker, overran its own `--timeout` on Windows CI by
-minutes. Its timeout is a polling loop in a thread; while another thread
-in that domain computed, the loop did not run, so nothing checked the
-clock. Full CPU throughout, no garbage collection involved.
+Kind 2, a model checker: about twelve domains, some allocating and some
+waiting on solver subprocesses between polls. On Windows it freezes for
+six to fourteen seconds at a time, and since its wall-clock timeout is
+checked in a polling loop, the timeout arrives that late. Same phases,
+same external consumer:
+
+```
+PAUSE stw_handler          14.16s in domain 4
+PAUSE interrupt_remote     14.21s in domain 0
+PAUSE minor_leave_barrier  14.16s in domain 4
+```
+
+## Not the same as ocaml/ocaml#15028
+
+[#15028](https://github.com/ocaml/ocaml/issues/15028) — a thread that
+never yields starving the other threads of its domain — was reported
+from this repository, fixed by
+[#15029](https://github.com/ocaml/ocaml/pull/15029), and released in
+5.5.1. **This is a different problem and persists on 5.5.1**, which is
+the version every measurement above was taken on. `starve.ml` in this
+repository still demonstrates the fixed one.
 
 ## Caveats
 
-- GitHub-hosted `windows-latest` runners only. No physical Windows box,
-  and only the mingw toolchain that `setup-ocaml` installs.
-- Actions logs expire, which is why the results are written out here
-  rather than only linked.
+- GitHub-hosted runners only, four cores, mingw via `setup-ocaml`.
+- Two rounds showed the program's own wall clock stretching to 102.6s
+  and 55.5s for a 30 second run while its ticker reported no gap at
+  all: those freezes landed inside `Domain.join`, after the ticker had
+  stopped. The freeze can outlast the window measuring it.
