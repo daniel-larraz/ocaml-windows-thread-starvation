@@ -38,9 +38,14 @@ jobs:
         set -u
         # allocating / idle. The first is Kind 2's shape: about twelve
         # domains, some of them waiting rather than working.
-        for arm in "11 3" "11 0" "6 2" "3 1" "1 0" ; do
+        # Three rounds of each, because the finding rests on the gap
+        # between "11 3" and "11 0" and one run of each is how several
+        # earlier readings in this investigation went wrong. "11 1"
+        # asks whether a single idle domain is enough.
+        for round in 1 2 3 ; do
+        for arm in "11 3" "11 1" "11 0" "6 2" ; do
           set -- $arm
-          echo "== allocating=$1 idle=$2 =="
+          echo "== allocating=$1 idle=$2 (round $round) =="
           rm -rf ev ; mkdir -p ev
           # A native path: these are native executables, and the
           # Cygwin form ("/cygdrive/d/...") leaves the target unable to
@@ -62,4 +67,5 @@ jobs:
           # Windows job reported no phases at all last time.
           ./pauses.exe "$EVDIR" 0 32 2>&1 | tail -14
           wait $target || true
+        done
         done
