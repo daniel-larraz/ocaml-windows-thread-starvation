@@ -42,10 +42,19 @@ jobs:
           set -- $arm
           echo "== allocating=$1 idle=$2 =="
           rm -rf ev ; mkdir -p ev
-          OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$PWD/ev" \
+          # A native path: these are native executables, and the
+          # Cygwin form ("/cygdrive/d/...") leaves the target unable to
+          # create its ring buffer at all.
+          if command -v cygpath >/dev/null 2>&1 ; then
+            EVDIR=$(cygpath -w "$PWD/ev")
+          else
+            EVDIR="$PWD/ev"
+          fi
+          echo "   events dir: $EVDIR"
+          OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$EVDIR" \
             ./barrier.exe "$1" 30 "$2" &
           target=$!
           sleep 1
-          ./pauses.exe "$PWD/ev" "$target" 32 2>&1 | tail -12
+          ./pauses.exe "$EVDIR" "$target" 32 2>&1 | tail -12
           wait $target || true
         done
