@@ -51,42 +51,52 @@ jobs:
         for round in 1 2 3 ; do
         for boosts in on off ; do
           echo "== priority boosts $boosts (round $round) =="
-          rm -rf ev ; mkdir -p ev
-          EVDIR=$(cygpath -w "$PWD/ev")
+          # A directory of this run's own, never reused. With one shared
+          # directory an earlier run's ring file, still mapped while that
+          # process exited, could be found in place of this one's -- which
+          # is how both the pid lookup and the consumer went wrong before.
+          evd="ev-$round-$boosts"
+          mkdir -p "$evd"
+          EVDIR=$(cygpath -w "$PWD/$evd")
           OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$EVDIR" \
-            ./barrier.exe 11 30 3 > out.txt &
+            ./barrier.exe 11 30 3 > "out-$round-$boosts.txt" &
           target=$!
 
-          # The Windows process ID, from the name of the ring buffer file
-          # the runtime creates. Not `$!`, which is a Cygwin pid, and not
-          # what the program prints: on Windows Unix.getpid returns a
-          # duplicated process *handle* (otherlibs/unix/startup.c), which
-          # no process has as its ID.
+          # The Windows process ID, from the ring file's name. Not `$!`,
+          # which is a Cygwin pid, and not what the program prints: on
+          # Windows Unix.getpid returns a duplicated process handle.
           winpid=""
           for _ in $(seq 1 100) ; do
-            winpid=$(ls ev 2>/dev/null | grep -o '^[0-9]*\.events' | head -1 | cut -d. -f1)
-            [ -n "$winpid" ] && break
+            f=$(ls "$evd" 2>/dev/null | grep -E '^[0-9]+\.events$' | head -1)
+            if [ -n "$f" ] ; then winpid=${f%.events} ; break ; fi
             sleep 0.05
           done
+          if [ -z "$winpid" ] ; then
+            echo "   no ring file appeared -- this run is not measured"
+          fi
+
           if [ "$boosts" = off ] ; then
             write='$p.PriorityBoostEnabled = $false ;'
           else
             write=''
           fi
+          # Name the process behind the pid, so a wrong pid is visible
+          # rather than silently measured.
           powershell -NoProfile -Command \
-            "\$p = Get-Process -Id $winpid ; $write 'pid $winpid, priority boost enabled: ' + \$p.PriorityBoostEnabled" \
-            | tr -d '\r' | sed 's/^/   /' || echo "   (could not reach pid $winpid)"
+            "\$p = Get-Process -Id $winpid ; $write 'pid $winpid is ' + \$p.ProcessName + ', priority boost enabled: ' + \$p.PriorityBoostEnabled" \
+            2>&1 | tr -d '\r' | head -2 | sed 's/^/   /'
 
-          ./pauses.exe "$EVDIR" 0 34 > ev.txt 2>&1
+          # The explicit pid, not 0: there is exactly one ring to watch.
+          ./pauses.exe "$EVDIR" "$winpid" 34 > "ev-$round-$boosts.txt" 2>&1
           rc=$?
           if [ $rc -ne 0 ] ; then
-            echo "   consumer exited $rc; its output:"
-            head -5 ev.txt | sed 's/^/     /'
-            echo "   ring directory: $(ls ev 2>/dev/null | tr '\n' ' ')"
+            echo "   consumer exited $rc:"
+            head -3 "ev-$round-$boosts.txt" | sed 's/^/     /'
           fi
-          wait $target || true
-          grep -a "worst ticker" out.txt || echo "   (no result line)"
-          echo "   spans over 1s: $(grep -ac '^PAUSE' ev.txt)"
-          grep -a "^stw_handler" ev.txt | sed 's/^/   /' || echo "   (no stw_handler line)"
+          wait $target
+          grep -a "worst ticker" "out-$round-$boosts.txt" || echo "   (no result line)"
+          echo "   spans over 1s: $(grep -ac '^PAUSE' "ev-$round-$boosts.txt")"
+          grep -a "^stw_handler" "ev-$round-$boosts.txt" | sed 's/^/   /' \
+            || echo "   (no stw_handler line)"
         done
         done
