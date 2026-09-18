@@ -81,7 +81,9 @@ jobs:
         git clone -q --depth 1 --branch 5.5.1 --recurse-submodules --shallow-submodules \
           https://github.com/ocaml/ocaml.git ocaml-src
         if [ "${{ matrix.arm }}" != stock ] ; then
-          git -C ocaml-src apply "$PWD/patches/${{ matrix.arm }}.patch"
+          # Relative: the runner's git is the native Windows one, and a
+          # Cygwin path ("/cygdrive/d/...") is a file it cannot open.
+          git -C ocaml-src apply "../patches/${{ matrix.arm }}.patch"
         fi
         git -C ocaml-src diff --stat
         grep -n "Max_sleep_nsec\|16 \* NSEC_PER_MSEC" ocaml-src/runtime/platform.c
