@@ -42,6 +42,11 @@ jobs:
     - name: Run
       shell: bash
       run: |
+        # setup-ocaml's bash starts with -e and pipefail. In a measuring
+        # loop that turns any single failure into a silent end of the
+        # step -- three rounds have been lost to it -- so failures are
+        # reported instead.
+        set +e +o pipefail
         set -u
         for round in 1 2 3 ; do
         for boosts in on off ; do
@@ -73,6 +78,12 @@ jobs:
             | tr -d '\r' | sed 's/^/   /' || echo "   (could not reach pid $winpid)"
 
           ./pauses.exe "$EVDIR" 0 34 > ev.txt 2>&1
+          rc=$?
+          if [ $rc -ne 0 ] ; then
+            echo "   consumer exited $rc; its output:"
+            head -5 ev.txt | sed 's/^/     /'
+            echo "   ring directory: $(ls ev 2>/dev/null | tr '\n' ' ')"
+          fi
           wait $target || true
           grep -a "worst ticker" out.txt || echo "   (no result line)"
           echo "   spans over 1s: $(grep -ac '^PAUSE' ev.txt)"
