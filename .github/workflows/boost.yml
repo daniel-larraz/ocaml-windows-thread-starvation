@@ -52,11 +52,14 @@ jobs:
             ./barrier.exe 11 30 3 > out.txt &
           target=$!
 
-          # The Windows pid, which the program prints first; `$!` is a
-          # Cygwin one.
+          # The Windows process ID, from the name of the ring buffer file
+          # the runtime creates. Not `$!`, which is a Cygwin pid, and not
+          # what the program prints: on Windows Unix.getpid returns a
+          # duplicated process *handle* (otherlibs/unix/startup.c), which
+          # no process has as its ID.
           winpid=""
-          for _ in $(seq 1 50) ; do
-            winpid=$(grep -ao 'pid [0-9]*' out.txt 2>/dev/null | head -1 | cut -d' ' -f2)
+          for _ in $(seq 1 100) ; do
+            winpid=$(ls ev 2>/dev/null | grep -o '^[0-9]*\.events' | head -1 | cut -d. -f1)
             [ -n "$winpid" ] && break
             sleep 0.05
           done
@@ -67,7 +70,7 @@ jobs:
           fi
           powershell -NoProfile -Command \
             "\$p = Get-Process -Id $winpid ; $write 'pid $winpid, priority boost enabled: ' + \$p.PriorityBoostEnabled" \
-            | tr -d '\r' | sed 's/^/   /'
+            | tr -d '\r' | sed 's/^/   /' || echo "   (could not reach pid $winpid)"
 
           ./pauses.exe "$EVDIR" 0 34 > ev.txt 2>&1
           wait $target || true
