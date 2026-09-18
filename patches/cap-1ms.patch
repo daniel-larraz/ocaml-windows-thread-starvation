@@ -1,0 +1,13 @@
+diff --git a/runtime/platform.c b/runtime/platform.c
+index ad27598..f527fa8 100644
+--- a/runtime/platform.c
++++ b/runtime/platform.c
+@@ -381,7 +381,7 @@ void caml_mem_unmap(void* mem, uintnat size)
+ 
+ #define Min_sleep_nsec  (10 * NSEC_PER_USEC) /* 10 usec */
+ #define Slow_sleep_nsec  (1 * NSEC_PER_MSEC) /*  1 msec */
+-#define Max_sleep_nsec   (1 * NSEC_PER_SEC)  /*  1 sec  */
++#define Max_sleep_nsec   (1 * NSEC_PER_MSEC) /*  1 msec: EXPERIMENT, cap the back-off */
+ 
+ unsigned caml_plat_spin_back_off(unsigned sleep_nsec,
+                                  const struct caml_plat_srcloc* loc)
