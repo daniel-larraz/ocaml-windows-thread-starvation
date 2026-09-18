@@ -1,0 +1,88 @@
+# Is it the length of the scheduler's time slice?
+#
+# Windows Server defaults to long fixed quanta (about 190ms, tuned for
+# background services); desktop Windows to short variable ones (about
+# 30ms, tuned for programs). The freeze reproduces on the runner, which
+# is Windows Server, and not on two desktop machines. A stop-the-world
+# section cannot finish until every domain reaches it, and with fifteen
+# domains on four cores a domain switched out under long quanta waits
+# a long time to run again.
+#
+# The setting is Win32PrioritySeparation. Three values, interleaved round
+# by round so drift on the runner cannot favour one of them:
+#
+#   default   whatever the runner ships with, recorded first
+#   0x26      short, variable -- "Programs", the desktop behaviour
+#   0x18      long, fixed     -- "Background services", explicitly
+#
+# If 0x26 clears the freezes and 0x18 keeps them, the quantum is the
+# variable, and choosing "Background services" on a physical machine
+# should reproduce it there.
+name: Is it the time slice
+
+on:
+  workflow_dispatch:
+
+jobs:
+  quantum:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.5.1
+
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam exec -- ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa \
+          barrier.ml -o barrier.exe
+        opam exec -- ocamlopt -I +unix -I +runtime_events \
+          unix.cmxa runtime_events.cmxa probe_pauses.ml -o pauses.exe
+
+    - name: What the runner ships with
+      shell: pwsh
+      run: |
+        Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl -Name Win32PrioritySeparation |
+          Select-Object -ExpandProperty Win32PrioritySeparation |
+          ForEach-Object { "Win32PrioritySeparation = 0x{0:x}" -f $_ }
+        (Get-CimInstance Win32_OperatingSystem).Caption
+        (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+        "logical processors: " + (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+
+    - name: Run
+      shell: bash
+      run: |
+        set -u
+        KEY='HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl'
+        ORIG=$(powershell -NoProfile -Command \
+          "(Get-ItemProperty -Path '$KEY' -Name Win32PrioritySeparation).Win32PrioritySeparation" | tr -d '\r')
+        echo "original value: $ORIG"
+
+        set_quantum() {
+          powershell -NoProfile -Command \
+            "Set-ItemProperty -Path '$KEY' -Name Win32PrioritySeparation -Value $1"
+          got=$(powershell -NoProfile -Command \
+            "(Get-ItemProperty -Path '$KEY' -Name Win32PrioritySeparation).Win32PrioritySeparation" | tr -d '\r')
+          printf '   Win32PrioritySeparation now 0x%x\n' "$got"
+        }
+
+        for round in 1 2 3 ; do
+        for setting in default 0x26 0x18 ; do
+          echo "== $setting (round $round) =="
+          if [ "$setting" = default ] ; then set_quantum "$ORIG" ; else set_quantum "$setting" ; fi
+          rm -rf ev ; mkdir -p ev
+          EVDIR=$(cygpath -w "$PWD/ev")
+          OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$EVDIR" \
+            ./barrier.exe 11 30 3 > out.txt &
+          target=$!
+          sleep 1
+          ./pauses.exe "$EVDIR" 0 34 > ev.txt 2>&1
+          wait $target || true
+          grep -a "worst ticker" out.txt || echo "   (no result line)"
+          echo "   spans over 1s: $(grep -ac '^PAUSE' ev.txt)"
+          grep -a "^stw_handler" ev.txt | sed 's/^/   /' || echo "   (no stw_handler line)"
+        done
+        done
+        set_quantum "$ORIG"
