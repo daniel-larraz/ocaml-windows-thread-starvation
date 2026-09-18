@@ -1,0 +1,78 @@
+# Is it Windows' starvation guard?
+#
+# The freeze lengths sit at 5.2-6.1s with a second cluster at roughly
+# double, through every change tried so far -- the back-off cap, no
+# Sleep below a tick, three scheduler time-slice settings. The runtime
+# has no timeout of that size; all its waits are INFINITE. Windows does:
+# once a second the balance set manager boosts any thread that has been
+# ready but unscheduled for about four seconds. Four seconds plus up to
+# one of scanning plus the rest of the barrier is five to six.
+#
+# What would starve a ready domain is threads running at a boosted
+# priority, and Windows boosts a thread briefly each time it wakes from
+# a wait -- which the idle domains do every 10ms. So turn those boosts
+# off for the process and see whether the freezes go.
+#
+# Both arms make the same PowerShell call at the same moment, one
+# writing and one only reading, so the call itself is not the
+# difference. Interleaved round by round.
+name: Is it the starvation guard
+
+on:
+  workflow_dispatch:
+
+jobs:
+  boost:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.5.1
+
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam exec -- ocamlopt -I +unix -I +threads unix.cmxa threads.cmxa \
+          barrier.ml -o barrier.exe
+        opam exec -- ocamlopt -I +unix -I +runtime_events \
+          unix.cmxa runtime_events.cmxa probe_pauses.ml -o pauses.exe
+
+    - name: Run
+      shell: bash
+      run: |
+        set -u
+        for round in 1 2 3 ; do
+        for boosts in on off ; do
+          echo "== priority boosts $boosts (round $round) =="
+          rm -rf ev ; mkdir -p ev
+          EVDIR=$(cygpath -w "$PWD/ev")
+          OCAML_RUNTIME_EVENTS_START=1 OCAML_RUNTIME_EVENTS_DIR="$EVDIR" \
+            ./barrier.exe 11 30 3 > out.txt &
+          target=$!
+
+          # The Windows pid, which the program prints first; `$!` is a
+          # Cygwin one.
+          winpid=""
+          for _ in $(seq 1 50) ; do
+            winpid=$(grep -ao 'pid [0-9]*' out.txt 2>/dev/null | head -1 | cut -d' ' -f2)
+            [ -n "$winpid" ] && break
+            sleep 0.05
+          done
+          if [ "$boosts" = off ] ; then
+            write='$p.PriorityBoostEnabled = $false ;'
+          else
+            write=''
+          fi
+          powershell -NoProfile -Command \
+            "\$p = Get-Process -Id $winpid ; $write 'pid $winpid, priority boost enabled: ' + \$p.PriorityBoostEnabled" \
+            | tr -d '\r' | sed 's/^/   /'
+
+          ./pauses.exe "$EVDIR" 0 34 > ev.txt 2>&1
+          wait $target || true
+          grep -a "worst ticker" out.txt || echo "   (no result line)"
+          echo "   spans over 1s: $(grep -ac '^PAUSE' ev.txt)"
+          grep -a "^stw_handler" ev.txt | sed 's/^/   /' || echo "   (no stw_handler line)"
+        done
+        done
