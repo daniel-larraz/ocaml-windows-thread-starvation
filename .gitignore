@@ -1,5 +1,8 @@
-starve
-starve.exe
+barrier_local
 *.cm[iox]
+ev/
+log*.txt
 *.o
 *.obj
+starve
+starve.exe
