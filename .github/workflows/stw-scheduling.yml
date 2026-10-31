@@ -1,0 +1,134 @@
+# Two questions at once, on the only environments known to reproduce #15042.
+#
+# 1. Is the stall actually priority inversion?  tstates.exe samples every
+#    thread's scheduler state and its current-vs-base priority from outside
+#    the process.  The mechanism proposed in the issue predicts a thread
+#    sitting *runnable but not running* for ~seconds at a priority BELOW the
+#    priority of the threads that are running.  Nobody has measured this yet;
+#    it has been inferred from runtime_events timings plus reasoning.
+#
+# 2. Is the trigger the Windows version?  The two machines known to reproduce
+#    both run Windows 11-generation kernels (Server 2025, Win 11 25H2); the
+#    one non-reproducer whose version is documented runs Windows 10.  Running
+#    the identical binaries on windows-2022 and windows-2025 settles it.
+#
+# Every arm carries its zero-sleeper control.  No published reproduction has
+# included one, and on a 2-physical-core machine an uncontrolled "11 3"
+# reading is indistinguishable from plain oversubscription: 11 allocating
+# domains alone produce the same ~11s of cumulative stall as 11 + 3 sleepers.
+# The sleepers only matter if the arms differ.
+#
+# OCAMLRUNPARAM=v=0x400 prints GC stats at exit.  Record minor_collections:
+# the patch under discussion raised it from 85 to 792 in 20s, which shows GC
+# progress being *starved* rather than merely delayed, and is a far stronger
+# discriminator than worst-stall.
+#
+# stall.exe takes [allocating] [sleeping] [seconds], in that order.
+
+name: STW scheduling states
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stw:
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-2022 may have been retired; fail-fast is off so the 2025
+        # leg still reports if that leg cannot start.
+        os: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Record the environment
+      shell: pwsh
+      run: |
+        [Environment]::OSVersion.VersionString
+        (Get-CimInstance Win32_OperatingSystem).Caption
+        Get-CimInstance Win32_Processor |
+          Select-Object Name,NumberOfCores,NumberOfLogicalProcessors |
+          Format-List
+        # Timer resolution: a non-requesting process gets the coarse default
+        # on Win10 2004+, so this is context, not a suspect.
+        $src = @"
+        using System;using System.Runtime.InteropServices;
+        public class TR{[DllImport("ntdll.dll")]
+        public static extern int NtQueryTimerResolution(out uint a,out uint b,out uint c);}
+        "@
+        Add-Type -TypeDefinition $src
+        [uint32]$a=0;[uint32]$b=0;[uint32]$c=0
+        [TR]::NtQueryTimerResolution([ref]$a,[ref]$b,[ref]$c) | Out-Null
+        "timer resolution: current {0:N4} ms (coarsest {1:N4}, finest {2:N4})" -f ($c/1e4),($a/1e4),($b/1e4)
+
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.5.1
+
+    - name: Record the build, for comparison with local builds
+      shell: bash
+      run: |
+        opam exec -- ocamlopt -config
+        opam exec -- flexlink -version || true
+        x86_64-w64-mingw32-gcc --version | head -1
+
+    - name: Build
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam exec -- ocamlopt -I +unix unix.cmxa stall.ml -o stall.exe
+        x86_64-w64-mingw32-gcc -O2 -Wall tstates.c -o tstates.exe
+
+    # ---- question 2: does it reproduce at all, and does the control differ?
+    - name: Stall matrix with controls
+      shell: bash
+      run: |
+        set -u
+        export OCAMLRUNPARAM=v=0x400
+        for round in 1 2 3 ; do
+          for arm in "11 3" "11 1" "11 0" ; do
+            set -- $arm
+            echo "===== round $round :: $1 allocating + $2 sleeping ====="
+            ./stall.exe "$1" "$2" 20 2>&1 || true
+            echo
+          done
+        done | tee stall-matrix.txt
+
+    # ---- question 1: is it priority inversion?
+    # --sampler-normal keeps the sampler off the child's back: at HIGH
+    # priority it preempts the priority 8-9 domain threads and can manufacture
+    # the inversion being looked for.  The target episodes are ~2s, so the
+    # ~20ms resolution of a normal-priority sampler is ample.
+    - name: Thread scheduling states, with control
+      shell: bash
+      run: |
+        set -u
+        export OCAMLRUNPARAM=v=0x400
+        for arm in "11 3" "11 0" ; do
+          set -- $arm
+          echo "===== tstates :: $1 allocating + $2 sleeping ====="
+          ./tstates.exe --sampler-normal --threshold 500 -- ./stall.exe "$1" "$2" 20 2>&1 || true
+          echo
+        done | tee tstates.txt
+
+    # A cross-check at finer resolution, in case no episode reaches 500ms.
+    # Perturbing, so read it only alongside the run above.
+    - name: Thread scheduling states, fine resolution (perturbing)
+      shell: bash
+      run: |
+        set -u
+        {
+          echo "===== tstates HIGH priority, 50ms threshold ====="
+          ./tstates.exe --threshold 50 --interval 2 -- ./stall.exe 11 3 20 2>&1 || true
+        } | tee tstates-fine.txt
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: stw-scheduling-${{ matrix.os }}
+        path: |
+          *.txt
+        if-no-files-found: ignore
