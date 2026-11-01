@@ -1,0 +1,130 @@
+# Does MisterDA's patch remove the freeze where it reproduces reliably?
+#
+# MisterDA/ocaml@7dd43fe (linked from ocaml/ocaml#15042, 27 Sep) adds
+# caml_wait_for_stw_end(): a domain that fails to start a stop-the-world
+# section blocks on all_domains_cond until the one in progress ends,
+# instead of retrying at once in a tight loop. On their machine it took
+# stall.exe 11 3 20 from a 2.028s worst stall to 0.055s, and minor
+# collections from 85 to 792.
+#
+# The patch sits on trunk commit c6daf5d, not on 5.5.1, so the baseline is
+# that same commit unpatched: the two arms differ by the patch alone.
+# windows-2025 froze in 16 of 16 sleeper runs on 5.5.1 (run 41323171067).
+#
+# Each compiler is built once, and its stall.exe shared with four test jobs.
+name: Patch on windows-2025
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -eo pipefail -o igncr {0}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - variant: patched
+          sha: 7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737
+        - variant: base
+          sha: c6daf5d6ef3dc536de229fffabf82bd33fb0308d
+    name: build ${{ matrix.variant }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Fetch OCaml at ${{ matrix.variant }}
+      uses: actions/checkout@v6
+      with:
+        repository: MisterDA/ocaml
+        ref: ${{ matrix.sha }}
+        path: ocaml-src
+        submodules: true
+
+    - name: Install Cygwin with the mingw-w64 toolchain
+      uses: cygwin/cygwin-install-action@v6
+      with:
+        packages: make,mingw64-x86_64-gcc-core,mingw64-x86_64-binutils,rsync,unzip
+        install-dir: 'D:\cygwin'
+
+    - name: Build and install OCaml
+      working-directory: ocaml-src
+      run: |
+        git log --oneline -1 || true
+        ./configure --host=x86_64-w64-mingw32 --prefix='D:/ocaml' \
+          --disable-ocamldoc --disable-ocamltest --disable-debugger
+        make -j4
+        make install
+        /cygdrive/d/ocaml/bin/ocamlopt -config | grep -E '^(version|architecture|system|ccomp_type):'
+
+    - name: Build stall.exe
+      run: |
+        export PATH="/cygdrive/d/ocaml/bin:$PATH"
+        ocamlopt -I +unix unix.cmxa stall.ml -o stall.exe
+        echo "DLLs stall.exe imports:"
+        x86_64-w64-mingw32-objdump -p stall.exe | sed -n 's/.*DLL Name: //p' | tee dlls.txt
+        mkdir -p out && cp stall.exe out/
+        # Ship anything that is not part of Windows itself beside the binary.
+        while read -r dll ; do
+          f=$(find /usr/x86_64-w64-mingw32/sys-root/mingw/bin -iname "$dll" 2>/dev/null | head -1)
+          if [ -n "$f" ] ; then echo "shipping $dll" ; cp "$f" out/ ; fi
+        done < dlls.txt
+
+    - name: Smoke test
+      run: ./out/stall.exe 2 1 2
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: stall-${{ matrix.variant }}
+        path: out/
+
+  stall:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, base]
+        shard: [1, 2, 3, 4]
+    name: ${{ matrix.variant }} shard ${{ matrix.shard }}
+    runs-on: windows-2025
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: stall-${{ matrix.variant }}
+        path: bin
+
+    - name: Record the host
+      shell: pwsh
+      run: |
+        $os = (Get-CimInstance Win32_OperatingSystem)
+        $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1)
+        "$($os.Caption) $($os.Version)"
+        "cpu=$($cpu.Name.Trim())" | Out-File -FilePath host.txt -Encoding ascii
+
+    - name: Stall, sleeper arm and control
+      shell: bash
+      run: |
+        set -u
+        cpu=$(sed -n 's/^cpu=//p' host.txt | tr -d '\r')
+        for round in 1 2 ; do
+          for sleep in 3 0 ; do
+            out=$(./bin/stall.exe 11 "$sleep" 20 2>&1 || true)
+            echo "$out"
+            worst=$(echo "$out" | sed -n 's/^worst stall \([0-9.]*\)s.*/\1/p')
+            minors=$(echo "$out" | sed -n 's/.*; \([0-9]*\) minor collections$/\1/p')
+            printf '%s | shard %s | %s | round %d | 11+%d | worst %ss | %s minor\n' \
+              "${{ matrix.variant }}" "${{ matrix.shard }}" "$cpu" "$round" "$sleep" \
+              "$worst" "$minors" | tee -a summary.txt
+          done
+        done
+
+    - name: Upload summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: patch-${{ matrix.variant }}-${{ matrix.shard }}
+        path: summary.txt
