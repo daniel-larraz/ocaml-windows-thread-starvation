@@ -1,0 +1,69 @@
+# Is it the Windows version or the host underneath it?
+#
+# Every runner job that froze so far ran Server 2025 on an AMD EPYC 9V74
+# host; every Server 2022 job ran on an EPYC 7763. The windows-2025 pool
+# mixes both host types, so eight parallel windows-2025 jobs should land
+# on some of each. If the freeze also appears on 7763 hosts, it is the OS;
+# if only on 9V74 hosts, it is the host or its hypervisor.
+#
+# Each job runs the sleeper arm and its zero-sleeper control twice,
+# interleaved. stall.exe takes [allocating] [sleeping] [seconds].
+name: Host or kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stall:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    name: windows-2025 shard ${{ matrix.shard }}
+    runs-on: windows-2025
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Record the host
+      shell: pwsh
+      run: |
+        $os = (Get-CimInstance Win32_OperatingSystem)
+        $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1)
+        "$($os.Caption) $($os.Version)"
+        "$($cpu.Name.Trim()), $($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) logical"
+        "cpu=$($cpu.Name.Trim())" | Out-File -FilePath host.txt -Encoding ascii
+        "os=$($os.Version)" | Out-File -FilePath host.txt -Encoding ascii -Append
+
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.5.1
+
+    - name: Build
+      shell: bash
+      run: opam exec -- ocamlopt -I +unix unix.cmxa stall.ml -o stall.exe
+
+    - name: Stall, sleeper arm and control
+      shell: bash
+      run: |
+        set -u
+        cpu=$(sed -n 's/^cpu=//p' host.txt | tr -d '\r')
+        for round in 1 2 ; do
+          for sleep in 3 0 ; do
+            out=$(./stall.exe 11 "$sleep" 20 2>&1 || true)
+            echo "$out"
+            worst=$(echo "$out" | sed -n 's/^worst stall \([0-9.]*\)s.*/\1/p')
+            minors=$(echo "$out" | sed -n 's/.*; \([0-9]*\) minor collections$/\1/p')
+            printf 'shard %s | %s | round %d | 11+%d | worst %ss | %s minor\n' \
+              "${{ matrix.shard }}" "$cpu" "$round" "$sleep" "$worst" "$minors" | tee -a summary.txt
+          done
+        done
+
+    - name: Upload summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: host-or-kernel-${{ matrix.shard }}
+        path: |
+          summary.txt
+          host.txt
