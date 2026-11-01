@@ -1,0 +1,107 @@
+# Does the patch cost anything where there is no freeze?
+#
+# The patch replaces the immediate retry of a failed STW attempt with a
+# blocking wait (a lock, a condition variable, a wake-up). On Windows that
+# removes the freeze; on Linux and macOS, where spinning was cheap, it may
+# instead make every failed attempt slower. Neither freezes, so the measure
+# is throughput: minor collections in 20s, and worst stall.
+#
+# Compares unpatched trunk c6daf5d against wait-mark-again (MisterDA's
+# 7dd43fe with patches/wait-before-mark-again.patch), the variant that
+# removed the freeze on windows-2025 without changing major GC pacing.
+# If the two match, spinning briefly before blocking is not needed.
+name: Patch cost on Linux and macOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stall:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        variant: [base, wait-mark-again]
+        shard: [1, 2]
+    name: ${{ matrix.os }} ${{ matrix.variant }} shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Pick the commit and patch for ${{ matrix.variant }}
+      id: pick
+      run: |
+        case "${{ matrix.variant }}" in
+          base)            sha=c6daf5d6ef3dc536de229fffabf82bd33fb0308d ; patch= ;;
+          wait-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=wait-before-mark-again.patch ;;
+          *) echo "::error::unknown variant ${{ matrix.variant }}" ; exit 1 ;;
+        esac
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "patch=$patch" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch OCaml at ${{ matrix.variant }}
+      uses: actions/checkout@v6
+      with:
+        repository: MisterDA/ocaml
+        ref: ${{ steps.pick.outputs.sha }}
+        path: ocaml-src
+
+    - name: Apply ${{ steps.pick.outputs.patch }}
+      if: steps.pick.outputs.patch != ''
+      working-directory: ocaml-src
+      run: |
+        git apply --verbose "../patches/${{ steps.pick.outputs.patch }}"
+        git diff --stat
+
+    - name: Record the host
+      run: |
+        set -u
+        if [ "$RUNNER_OS" = macOS ] ; then
+          cpu=$(sysctl -n machdep.cpu.brand_string) ; n=$(sysctl -n hw.ncpu)
+          sw_vers
+        else
+          cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1) ; n=$(nproc)
+          uname -a
+        fi
+        echo "$cpu, $n processors"
+        echo "cpu=$cpu ($n)" > host.txt
+        echo "NPROC=$n" >> "$GITHUB_ENV"
+
+    - name: Build and install OCaml
+      working-directory: ocaml-src
+      run: |
+        set -euo pipefail
+        ./configure --prefix="$HOME/ocaml" \
+          --disable-ocamldoc --disable-ocamltest --disable-debugger
+        make -j"$NPROC"
+        make install
+        "$HOME/ocaml/bin/ocamlopt" -config | grep -E '^(version|architecture|system):'
+
+    - name: Build stall.exe
+      run: |
+        "$HOME/ocaml/bin/ocamlopt" -I +unix unix.cmxa stall.ml -o stall.exe
+        ./stall.exe 2 1 2
+
+    - name: Stall, sleeper arm and control
+      run: |
+        set -u
+        cpu=$(sed -n 's/^cpu=//p' host.txt)
+        for round in 1 2 ; do
+          for sleep in 3 0 ; do
+            out=$(./stall.exe 11 "$sleep" 20 2>&1 || true)
+            echo "$out"
+            worst=$(echo "$out" | sed -n 's/^worst stall \([0-9.]*\)s.*/\1/p')
+            minors=$(echo "$out" | sed -n 's/.*; \([0-9]*\) minor collections$/\1/p')
+            printf '%s | %s | shard %s | %s | round %d | 11+%d | worst %ss | %s minor\n' \
+              "${{ matrix.os }}" "${{ matrix.variant }}" "${{ matrix.shard }}" "$cpu" \
+              "$round" "$sleep" "$worst" "$minors" | tee -a summary.txt
+          done
+        done
+
+    - name: Upload summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: unix-${{ matrix.os }}-${{ matrix.variant }}-${{ matrix.shard }}
+        path: summary.txt
