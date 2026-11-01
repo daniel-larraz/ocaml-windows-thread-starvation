@@ -12,10 +12,23 @@
 # windows-2025 froze in 16 of 16 sleeper runs on 5.5.1 (run 41323171067).
 #
 # Each compiler is built once, and its stall.exe shared with four test jobs.
+#
+# Variants (the `variants` input picks which to build and run):
+#   base               c6daf5d, unpatched
+#   patched            7dd43fe as published
+#   keep-mark-again    7dd43fe without its major_gc.c mark_again change, so
+#                      a failed attempt there goes back to marking at once
+#   wait-mark-again    7dd43fe, but in mark_again a failed attempt waits for
+#                      the section to end and then keeps marking, instead of
+#                      ending the slice: the major GC pacing is unchanged
 name: Patch on windows-2025
 
 on:
   workflow_dispatch:
+    inputs:
+      variants:
+        description: JSON list of variants to build and run
+        default: '["base", "patched"]'
 
 defaults:
   run:
@@ -26,24 +39,47 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-        - variant: patched
-          sha: 7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737
-        - variant: base
-          sha: c6daf5d6ef3dc536de229fffabf82bd33fb0308d
+        variant: ${{ fromJSON(inputs.variants) }}
     name: build ${{ matrix.variant }}
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
+    # Keep LF endings, so that the patches apply to the sources as written.
+    - name: Check out without CRLF conversion
+      shell: bash
+      run: git config --global core.autocrlf false
+
     - uses: actions/checkout@v6
+
+    - name: Pick the commit and patch for ${{ matrix.variant }}
+      id: pick
+      shell: bash
+      run: |
+        case "${{ matrix.variant }}" in
+          base)            sha=c6daf5d6ef3dc536de229fffabf82bd33fb0308d ; patch= ;;
+          patched)         sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch= ;;
+          keep-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=keep-mark-again.patch ;;
+          wait-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=wait-before-mark-again.patch ;;
+          *) echo "::error::unknown variant ${{ matrix.variant }}" ; exit 1 ;;
+        esac
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "patch=$patch" >> "$GITHUB_OUTPUT"
 
     - name: Fetch OCaml at ${{ matrix.variant }}
       uses: actions/checkout@v6
       with:
         repository: MisterDA/ocaml
-        ref: ${{ matrix.sha }}
+        ref: ${{ steps.pick.outputs.sha }}
         path: ocaml-src
         submodules: true
+
+    - name: Apply ${{ steps.pick.outputs.patch }}
+      if: steps.pick.outputs.patch != ''
+      shell: bash
+      working-directory: ocaml-src
+      run: |
+        git apply --verbose "../patches/${{ steps.pick.outputs.patch }}"
+        git diff --stat
 
     - name: Install Cygwin with the mingw-w64 toolchain
       uses: cygwin/cygwin-install-action@v6
@@ -87,7 +123,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [patched, base]
+        variant: ${{ fromJSON(inputs.variants) }}
         shard: [1, 2, 3, 4]
     name: ${{ matrix.variant }} shard ${{ matrix.shard }}
     runs-on: windows-2025

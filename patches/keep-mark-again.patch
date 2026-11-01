@@ -1,0 +1,27 @@
+diff --git a/runtime/major_gc.c b/runtime/major_gc.c
+index a4b507480..174043005 100644
+--- a/runtime/major_gc.c
++++ b/runtime/major_gc.c
+@@ -2420,7 +2420,6 @@ mark_again:
+     if (is_complete_phase_sweep_and_mark_main() ||
+         is_complete_phase_mark_final ()) {
+       CAMLassert (caml_gc_phase != Phase_sweep_ephe);
+-      int tried = 1;
+       if (barrier_participants) {
+         stw_try_complete_gc_phase(
+           domain_state,
+@@ -2428,12 +2427,9 @@ mark_again:
+           participant_count,
+           barrier_participants);
+       } else {
+-        tried = caml_try_run_on_all_domains (&stw_try_complete_gc_phase, 0, 0);
++        caml_try_run_on_all_domains (&stw_try_complete_gc_phase, 0, 0);
+       }
+-      /* If another STW section was in progress, going back to marking
+-         would only retry it straight away, as a failed attempt does not
+-         use up the budget: leave that to the next slice. */
+-      if (tried && get_major_slice_work(mode) > 0) goto mark_again;
++      if (get_major_slice_work(mode) > 0) goto mark_again;
+     }
+   }
+ 

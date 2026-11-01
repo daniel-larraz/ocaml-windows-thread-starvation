@@ -1,0 +1,20 @@
+diff --git a/runtime/major_gc.c b/runtime/major_gc.c
+index a4b507480..6be9933b6 100644
+--- a/runtime/major_gc.c
++++ b/runtime/major_gc.c
+@@ -2430,10 +2430,11 @@ mark_again:
+       } else {
+         tried = caml_try_run_on_all_domains (&stw_try_complete_gc_phase, 0, 0);
+       }
+-      /* If another STW section was in progress, going back to marking
+-         would only retry it straight away, as a failed attempt does not
+-         use up the budget: leave that to the next slice. */
+-      if (tried && get_major_slice_work(mode) > 0) goto mark_again;
++      /* If another STW section was in progress, wait for it to end
++         before going back to marking, rather than retrying straight
++         away: a failed attempt does not use up the budget. */
++      if (!tried) caml_wait_for_stw_end();
++      if (get_major_slice_work(mode) > 0) goto mark_again;
+     }
+   }
+ 
