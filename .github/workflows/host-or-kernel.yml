@@ -8,10 +8,19 @@
 #
 # Each job runs the sleeper arm and its zero-sleeper control twice,
 # interleaved. stall.exe takes [allocating] [sleeping] [seconds].
+#
+# The `os` input runs the same jobs on windows-2022, whose hosts so far
+# have all been EPYC 7763: the side of the comparison with the fewest runs.
 name: Host or kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      os:
+        description: Runner image
+        default: windows-2025
+        type: choice
+        options: [windows-2025, windows-2022]
 
 jobs:
   stall:
@@ -19,8 +28,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    name: windows-2025 shard ${{ matrix.shard }}
-    runs-on: windows-2025
+    name: ${{ inputs.os }} shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.os }}
     steps:
     - uses: actions/checkout@v6
 
@@ -63,7 +72,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: host-or-kernel-${{ matrix.shard }}
+        name: host-or-kernel-${{ inputs.os }}-${{ matrix.shard }}
         path: |
           summary.txt
           host.txt
