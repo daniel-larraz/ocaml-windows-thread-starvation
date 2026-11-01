@@ -1,0 +1,138 @@
+# Does the patch also fix ocaml/ocaml#11818 on Linux?
+#
+# #11818: spectralnorm, parallelised with Domainslib, runs ~13x slower as
+# soon as there are more domains than hardware threads (25 domains on 24).
+# gasche traced it in December 2022 to the same busy retry as #15042: a
+# domain descheduled inside an STW section, and the others spinning in
+# caml_try_run_on_all_domains_with_spin_work until it ends.
+#
+# Compares unpatched trunk c6daf5d with wait-mark-again (7dd43fe plus
+# patches/wait-before-mark-again.patch) on ubuntu-latest, 4 logical CPUs,
+# with 1, 4, 5 and 8 domains. The reproducer is the issue's own main.ml.
+#
+# Domainslib and its runtime dependencies are pure OCaml and are built
+# vendored, at fixed versions, with each compiler; dune is bootstrapped
+# with that compiler too, so no opam is involved.
+name: Patch and 11818 on Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  spectralnorm:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, wait-mark-again]
+        shard: [1, 2]
+    name: ${{ matrix.variant }} shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Pick the commit and patch for ${{ matrix.variant }}
+      id: pick
+      run: |
+        case "${{ matrix.variant }}" in
+          base)            sha=c6daf5d6ef3dc536de229fffabf82bd33fb0308d ; patch= ;;
+          wait-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=wait-before-mark-again.patch ;;
+          *) echo "::error::unknown variant ${{ matrix.variant }}" ; exit 1 ;;
+        esac
+        echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "patch=$patch" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch OCaml at ${{ matrix.variant }}
+      uses: actions/checkout@v6
+      with:
+        repository: MisterDA/ocaml
+        ref: ${{ steps.pick.outputs.sha }}
+        path: ocaml-src
+
+    - name: Apply ${{ steps.pick.outputs.patch }}
+      if: steps.pick.outputs.patch != ''
+      working-directory: ocaml-src
+      run: git apply --verbose "../patches/${{ steps.pick.outputs.patch }}"
+
+    - name: Record the host
+      run: |
+        cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)
+        echo "$cpu, $(nproc) processors"
+        echo "$cpu" > cpu.txt
+
+    - name: Build and install OCaml
+      working-directory: ocaml-src
+      run: |
+        set -euo pipefail
+        ./configure --prefix="$HOME/ocaml" \
+          --disable-ocamldoc --disable-ocamltest --disable-debugger
+        make -j"$(nproc)"
+        make install
+        echo "$HOME/ocaml/bin" >> "$GITHUB_PATH"
+
+    - name: Bootstrap dune with this compiler
+      run: |
+        set -euo pipefail
+        git clone -q --depth 1 -b 3.24.2 https://github.com/ocaml/dune.git dune-src
+        cd dune-src
+        ocaml boot/bootstrap.ml
+        mkdir -p "$HOME/ocaml/bin" && cp _boot/dune.exe "$HOME/ocaml/bin/dune"
+        dune --version
+
+    - name: Vendor Domainslib and its dependencies
+      run: |
+        set -euo pipefail
+        mkdir -p sn/vendor sn/bench
+        while IFS=: read -r dir repo tag ; do
+          git clone -q --depth 1 -b "$tag" "https://github.com/$repo.git" "sn/vendor/$dir"
+          rm -rf "sn/vendor/$dir/.git"
+          echo "vendored $repo $tag"
+        done <<'EOF'
+        domainslib:ocaml-multicore/domainslib:0.5.2
+        saturn:ocaml-multicore/saturn:1.0.0
+        backoff:ocaml-multicore/backoff:0.1.1
+        multicore-magic:ocaml-multicore/multicore-magic:2.3.2
+        domain-local-await:ocaml-multicore/domain-local-await:1.0.1
+        thread-table:ocaml-multicore/thread-table:1.0.0
+        EOF
+        cp spectralnorm_11818.ml sn/bench/main.ml
+        printf '(executable\n (name main)\n (libraries domainslib))\n' > sn/bench/dune
+        printf '(vendored_dirs vendor)\n' > sn/dune
+        printf '(lang dune 3.14)\n' > sn/dune-project
+
+    - name: Build spectralnorm
+      working-directory: sn
+      run: |
+        dune build --root . --profile release ./bench/main.exe
+        ./_build/default/bench/main.exe 2 256
+
+    # Three runs per domain count, each bounded at 300s. 4 domains is one
+    # per logical CPU; 5 is the first oversubscribed count, the case #11818
+    # is about; 8 is twice the CPUs.
+    - name: Time spectralnorm 4096 by domain count
+      working-directory: sn
+      run: |
+        set -u
+        cpu=$(cat ../cpu.txt)
+        for rep in 1 2 3 ; do
+          for d in 1 4 5 8 ; do
+            start=$(date +%s.%N)
+            if timeout 300 ./_build/default/bench/main.exe "$d" 4096 > out.txt 2>&1 ; then
+              status=ok
+            else
+              status="exit $?"
+            fi
+            end=$(date +%s.%N)
+            secs=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
+            printf '%s | shard %s | %s | rep %d | %d domains | %ss | %s | %s\n' \
+              "${{ matrix.variant }}" "${{ matrix.shard }}" "$cpu" "$rep" "$d" \
+              "$secs" "$status" "$(head -1 out.txt)" | tee -a ../summary.txt
+          done
+        done
+
+    - name: Upload summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: s11818-${{ matrix.variant }}-${{ matrix.shard }}
+        path: summary.txt
