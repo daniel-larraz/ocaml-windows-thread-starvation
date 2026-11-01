@@ -6,9 +6,10 @@
 # domain descheduled inside an STW section, and the others spinning in
 # caml_try_run_on_all_domains_with_spin_work until it ends.
 #
-# Compares unpatched trunk c6daf5d with wait-mark-again (7dd43fe plus
-# patches/wait-before-mark-again.patch) on ubuntu-latest, 4 logical CPUs,
-# with 1, 4, 5 and 8 domains. The reproducer is the issue's own main.ml.
+# Compares unpatched trunk c6daf5d with variants of MisterDA's 7dd43fe
+# (the same ones as patch.yml) on ubuntu-latest, 4 logical CPUs, with 1, 4,
+# 5 and 8 domains. The `variants` input picks which to run. The reproducer
+# is the issue's own main.ml.
 #
 # Domainslib and its runtime dependencies are pure OCaml and are built
 # vendored, at fixed versions, with each compiler; dune is bootstrapped
@@ -17,13 +18,17 @@ name: Patch and 11818 on Linux
 
 on:
   workflow_dispatch:
+    inputs:
+      variants:
+        description: JSON list of variants (base, patched, keep-mark-again, wait-mark-again)
+        default: '["base", "wait-mark-again"]'
 
 jobs:
   spectralnorm:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, wait-mark-again]
+        variant: ${{ fromJSON(inputs.variants) }}
         shard: [1, 2]
     name: ${{ matrix.variant }} shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -36,6 +41,8 @@ jobs:
       run: |
         case "${{ matrix.variant }}" in
           base)            sha=c6daf5d6ef3dc536de229fffabf82bd33fb0308d ; patch= ;;
+          patched)         sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch= ;;
+          keep-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=keep-mark-again.patch ;;
           wait-mark-again) sha=7dd43fe418c8ddf1150a3a68b8deff0e4bbd6737 ; patch=wait-before-mark-again.patch ;;
           *) echo "::error::unknown variant ${{ matrix.variant }}" ; exit 1 ;;
         esac
